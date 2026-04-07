@@ -1,0 +1,1486 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Information Design Toolkit — BCE, Coordinated Equilibrium, Bayesian Persuasion</title>
+  <meta name="description" content="Compute BCE, coordinated equilibria (Doval-Ely), and Bayesian persuasion for 1-3 player games. Free, open-source, runs in your browser." />
+  <script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <link href="https://fonts.googleapis.com/css2?family=Source+Serif+4:opsz,wght@8..60,300;8..60,400;8..60,600;8..60,700&family=JetBrains+Mono:wght@400;500&family=DM+Sans:wght@400;500;600&display=swap" rel="stylesheet" />
+  <style>body { margin: 0; }</style>
+</head>
+<body>
+  <div id="root"></div>
+  <script type="text/babel">
+const { useState, useMemo, useCallback, useEffect, useRef } = React;
+
+/* ═══ LP SOLVER ═══ */
+const LP_EPS = 1e-9, BIG_M = 1e7, MAX_ITER = 5000;
+function solveLP(c, Aub, bub, Aeq, beq) {
+  const n = c.length, m1 = Aub ? Aub.length : 0, m2 = Aeq ? Aeq.length : 0, m = m1 + m2;
+  if (m === 0 || n === 0) return { status: "error", x: null, value: null };
+  const cAub = [], cBub = [], cAeq = [], cBeq = [];
+  for (let i = 0; i < m1; i++) { if (bub[i] < -LP_EPS) { cAub.push(Aub[i].map(v => -v)); cBub.push(-bub[i]); } else { cAub.push([...Aub[i]]); cBub.push(bub[i]); } }
+  for (let i = 0; i < m2; i++) { if (beq[i] < -LP_EPS) { cAeq.push(Aeq[i].map(v => -v)); cBeq.push(-beq[i]); } else { cAeq.push([...Aeq[i]]); cBeq.push(beq[i]); } }
+  const numSlack = m1, numArt = m2, totalVars = n + numSlack + numArt;
+  const tab = Array.from({ length: m + 1 }, () => new Float64Array(totalVars + 1));
+  const basis = new Int32Array(m), isArt = new Uint8Array(totalVars);
+  for (let i = 0; i < m1; i++) { for (let j = 0; j < n; j++) tab[i][j] = cAub[i][j]; tab[i][n + i] = 1; tab[i][totalVars] = cBub[i]; basis[i] = n + i; }
+  for (let i = 0; i < m2; i++) { const row = m1 + i; for (let j = 0; j < n; j++) tab[row][j] = cAeq[i][j]; const artIdx = n + numSlack + i; tab[row][artIdx] = 1; tab[row][totalVars] = cBeq[i]; basis[row] = artIdx; isArt[artIdx] = 1; }
+  for (let j = 0; j < n; j++) tab[m][j] = -c[j];
+  for (let j = n + numSlack; j < totalVars; j++) tab[m][j] = BIG_M;
+  for (let i = 0; i < m; i++) { if (isArt[basis[i]]) for (let j = 0; j <= totalVars; j++) tab[m][j] -= BIG_M * tab[i][j]; }
+  for (let iter = 0; iter < MAX_ITER; iter++) {
+    let pivCol = -1, minRC = -LP_EPS;
+    for (let j = 0; j < totalVars; j++) if (tab[m][j] < minRC) { minRC = tab[m][j]; pivCol = j; }
+    if (pivCol === -1) break;
+    let pivRow = -1, minRatio = Infinity;
+    for (let i = 0; i < m; i++) if (tab[i][pivCol] > LP_EPS) { const r = tab[i][totalVars] / tab[i][pivCol]; if (r < minRatio - LP_EPS) { minRatio = r; pivRow = i; } }
+    if (pivRow === -1) return { status: "unbounded", x: null, value: Infinity };
+    const pv = tab[pivRow][pivCol];
+    for (let j = 0; j <= totalVars; j++) tab[pivRow][j] /= pv;
+    for (let i = 0; i <= m; i++) { if (i === pivRow) continue; const f = tab[i][pivCol]; if (Math.abs(f) < LP_EPS) continue; for (let j = 0; j <= totalVars; j++) tab[i][j] -= f * tab[pivRow][j]; }
+    basis[pivRow] = pivCol;
+  }
+  for (let i = 0; i < m; i++) if (isArt[basis[i]] && tab[i][totalVars] > LP_EPS) return { status: "infeasible", x: null, value: null };
+  const x = new Array(n).fill(0);
+  for (let i = 0; i < m; i++) if (basis[i] < n) x[basis[i]] = Math.max(0, tab[i][totalVars]);
+  return { status: "optimal", x, value: tab[m][totalVars] };
+}
+
+/* ═══ GENERAL BCE ═══ */
+function buildBCE(NP, acts, K, prior, payoffs, obj) {
+  const numP = acts.reduce((a, b) => a * b, 1), n = numP * K;
+  const Aeq = [], beq = [];
+  for (let th = 0; th < K; th++) { const row = new Array(n).fill(0); for (let p = 0; p < numP; p++) row[p * K + th] = 1; Aeq.push(row); beq.push(prior[th]); }
+  const Aub = [], bub = [];
+  for (let i = 0; i < NP; i++) {
+    const stride = acts.slice(i + 1).reduce((a, b) => a * b, 1);
+    for (let ai = 0; ai < acts[i]; ai++) for (let aip = 0; aip < acts[i]; aip++) {
+      if (ai === aip) continue;
+      const row = new Array(n).fill(0);
+      for (let p = 0; p < numP; p++) { if (Math.floor(p / stride) % acts[i] !== ai) continue; const pD = p + (aip - ai) * stride; for (let th = 0; th < K; th++) row[p * K + th] = payoffs[i][pD * K + th] - payoffs[i][p * K + th]; }
+      Aub.push(row); bub.push(0);
+    }
+  }
+  return { c: [...obj], Aub, bub, Aeq, beq, n };
+}
+
+function solveBCE(NP, acts, K, prior, payoffs, obj, sense) {
+  const sObj = sense === "max" ? [...obj] : obj.map(v => -v);
+  const lp = buildBCE(NP, acts, K, prior, payoffs, sObj);
+  const res = solveLP(lp.c, lp.Aub, lp.bub, lp.Aeq, lp.beq);
+  if (res.status !== "optimal") return { ...res, ep: null, ov: null };
+  const n = acts.reduce((a, b) => a * b, 1) * K;
+  const ep = Array.from({ length: NP }, () => 0);
+  for (let i = 0; i < NP; i++) for (let k = 0; k < n; k++) ep[i] += res.x[k] * payoffs[i][k];
+  let ov = 0; for (let k = 0; k < n; k++) ov += res.x[k] * obj[k];
+  return { status: "optimal", x: res.x, ep, ov };
+}
+
+/* ═══ COORDINATED EQUILIBRIUM (Doval-Ely) ═══ */
+function enumPlans(m1, m2) {
+  const plans = [];
+  // Plans where player 0 moves first
+  const nf = Math.pow(m2, m1);
+  for (let rec = 0; rec < m1; rec++) {
+    for (let fi = 0; fi < nf; fi++) {
+      const resp = []; let tmp = fi;
+      for (let d = 0; d < m1; d++) { resp.push(tmp % m2); tmp = Math.floor(tmp / m2); }
+      plans.push({ first: 0, rec, resp });
+    }
+  }
+  // Plans where player 1 moves first
+  const ng = Math.pow(m1, m2);
+  for (let rec = 0; rec < m2; rec++) {
+    for (let gi = 0; gi < ng; gi++) {
+      const resp = []; let tmp = gi;
+      for (let d = 0; d < m2; d++) { resp.push(tmp % m1); tmp = Math.floor(tmp / m1); }
+      plans.push({ first: 1, rec, resp });
+    }
+  }
+  return plans;
+}
+
+function planObed(p) { return p.first === 0 ? [p.rec, p.resp[p.rec]] : [p.resp[p.rec], p.rec]; }
+
+function planDev(p, player, bi) {
+  if (p.first === 0) return player === 0 ? [bi, p.resp[bi]] : [p.rec, bi];
+  else return player === 1 ? [p.resp[bi], bi] : [bi, p.rec];
+}
+
+function planAct(p, player) { return p.first === player ? p.rec : p.resp[p.rec]; }
+
+function solveCEDE(acts, K, prior, payoffs, obj, sense) {
+  const m1 = acts[0], m2 = acts[1];
+  const plans = enumPlans(m1, m2);
+  const nP = plans.length, nVar = nP * K;
+  const profIdx = (a) => a[0] * m2 + a[1];
+  const numProf = m1 * m2;
+
+  // Objective: map plan obedient outcome to obj value
+  const c = new Array(nVar).fill(0);
+  for (let pi = 0; pi < nP; pi++) {
+    const ob = planObed(plans[pi]);
+    const pr = profIdx(ob);
+    for (let th = 0; th < K; th++)
+      c[pi * K + th] = (sense === "max" ? 1 : -1) * obj[pr * K + th];
+  }
+
+  // Prior consistency
+  const Aeq = [], beq = [];
+  for (let th = 0; th < K; th++) {
+    const row = new Array(nVar).fill(0);
+    for (let pi = 0; pi < nP; pi++) row[pi * K + th] = 1;
+    Aeq.push(row); beq.push(prior[th]);
+  }
+
+  // Obedience
+  const Aub = [], bub = [];
+  for (let i = 0; i < 2; i++) {
+    const mi = acts[i];
+    for (let ai = 0; ai < mi; ai++) {
+      for (let bi = 0; bi < mi; bi++) {
+        if (ai === bi) continue;
+        const row = new Array(nVar).fill(0);
+        for (let pi = 0; pi < nP; pi++) {
+          if (planAct(plans[pi], i) !== ai) continue;
+          const obP = profIdx(planObed(plans[pi]));
+          const dvP = profIdx(planDev(plans[pi], i, bi));
+          for (let th = 0; th < K; th++)
+            row[pi * K + th] = payoffs[i][dvP * K + th] - payoffs[i][obP * K + th];
+        }
+        Aub.push(row); bub.push(0);
+      }
+    }
+  }
+
+  const res = solveLP(c, Aub, bub, Aeq, beq);
+  if (res.status !== "optimal") return { ...res, ep: null, ov: null, xProf: null };
+
+  // Map back to action profile distribution
+  const xProf = new Array(numProf * K).fill(0);
+  for (let pi = 0; pi < nP; pi++) {
+    const pr = profIdx(planObed(plans[pi]));
+    for (let th = 0; th < K; th++) xProf[pr * K + th] += res.x[pi * K + th];
+  }
+
+  // Expected payoffs
+  const ep = [0, 0];
+  for (let pi = 0; pi < nP; pi++) {
+    const pr = profIdx(planObed(plans[pi]));
+    for (let th = 0; th < K; th++) {
+      ep[0] += res.x[pi * K + th] * payoffs[0][pr * K + th];
+      ep[1] += res.x[pi * K + th] * payoffs[1][pr * K + th];
+    }
+  }
+
+  let ov = 0;
+  for (let pi = 0; pi < nP; pi++) {
+    const pr = profIdx(planObed(plans[pi]));
+    for (let th = 0; th < K; th++) ov += res.x[pi * K + th] * obj[pr * K + th];
+  }
+
+  return { status: "optimal", x: res.x, xProf, ep, ov, nPlans: nP };
+}
+
+function frontierCEDE(acts, K, prior, payoffs) {
+  const m1 = acts[0], m2 = acts[1];
+  const plans = enumPlans(m1, m2);
+  const nP = plans.length, nVar = nP * K;
+  const numProf = m1 * m2;
+  const profIdx = (a) => a[0] * m2 + a[1];
+
+  const Aeq = [], beq = [];
+  for (let th = 0; th < K; th++) {
+    const row = new Array(nVar).fill(0);
+    for (let pi = 0; pi < nP; pi++) row[pi * K + th] = 1;
+    Aeq.push(row); beq.push(prior[th]);
+  }
+  const Aub = [], bub = [];
+  for (let i = 0; i < 2; i++) {
+    const mi = acts[i];
+    for (let ai = 0; ai < mi; ai++) for (let bi = 0; bi < mi; bi++) {
+      if (ai === bi) continue;
+      const row = new Array(nVar).fill(0);
+      for (let pi = 0; pi < nP; pi++) {
+        if (planAct(plans[pi], i) !== ai) continue;
+        const obP = profIdx(planObed(plans[pi]));
+        const dvP = profIdx(planDev(plans[pi], i, bi));
+        for (let th = 0; th < K; th++)
+          row[pi * K + th] = payoffs[i][dvP * K + th] - payoffs[i][obP * K + th];
+      }
+      Aub.push(row); bub.push(0);
+    }
+  }
+
+  // Precompute plan-level payoff vectors
+  const pay = [new Array(nVar).fill(0), new Array(nVar).fill(0)];
+  for (let pi = 0; pi < nP; pi++) {
+    const pr = profIdx(planObed(plans[pi]));
+    for (let th = 0; th < K; th++) {
+      pay[0][pi * K + th] = payoffs[0][pr * K + th];
+      pay[1][pi * K + th] = payoffs[1][pr * K + th];
+    }
+  }
+
+  const pts = [];
+  for (let i = 0; i < 72; i++) {
+    const ang = (2 * Math.PI * i) / 72;
+    const w1 = Math.cos(ang), w2 = Math.sin(ang);
+    const c = new Array(nVar);
+    for (let k = 0; k < nVar; k++) c[k] = w1 * pay[0][k] + w2 * pay[1][k];
+    const r = solveLP(c, Aub, bub, Aeq, beq);
+    if (r.status === "optimal") {
+      let e1 = 0, e2 = 0;
+      for (let k = 0; k < nVar; k++) { e1 += r.x[k] * pay[0][k]; e2 += r.x[k] * pay[1][k]; }
+      pts.push([e1, e2]);
+    }
+  }
+  const uniq = []; for (const p of pts) if (!uniq.some(q => Math.abs(q[0] - p[0]) < 1e-6 && Math.abs(q[1] - p[1]) < 1e-6)) uniq.push(p);
+  if (uniq.length <= 2) return uniq;
+  const hull = cHull(uniq); return hull.length >= 3 ? hull : uniq;
+}
+
+/* ═══ SELF-CONTAINED CE (Doval-Ely refinement) ═══ */
+function filterPlans(plans, acts, surv) {
+  return plans.filter(p => {
+    if (p.first === 0) {
+      if (!surv[0].includes(p.rec)) return false;
+      for (let b = 0; b < acts[0]; b++) if (!surv[1].includes(p.resp[b])) return false;
+    } else {
+      if (!surv[1].includes(p.rec)) return false;
+      for (let b = 0; b < acts[1]; b++) if (!surv[0].includes(p.resp[b])) return false;
+    }
+    return true;
+  });
+}
+
+function buildCEDE_LP(plans, acts, K, prior, payoffs) {
+  const nP = plans.length, nVar = nP * K, m2 = acts[1];
+  const profI = (a) => a[0] * m2 + a[1];
+  const Aeq = [], beq = [];
+  for (let th = 0; th < K; th++) {
+    const row = new Array(nVar).fill(0);
+    for (let pi = 0; pi < nP; pi++) row[pi * K + th] = 1;
+    Aeq.push(row); beq.push(prior[th]);
+  }
+  const Aub = [], bub = [];
+  for (let i = 0; i < 2; i++) for (let ai = 0; ai < acts[i]; ai++) for (let bi = 0; bi < acts[i]; bi++) {
+    if (ai === bi) continue;
+    const row = new Array(nVar).fill(0);
+    for (let pi = 0; pi < nP; pi++) {
+      if (planAct(plans[pi], i) !== ai) continue;
+      const obP = profI(planObed(plans[pi])), dvP = profI(planDev(plans[pi], i, bi));
+      for (let th = 0; th < K; th++) row[pi * K + th] = payoffs[i][dvP * K + th] - payoffs[i][obP * K + th];
+    }
+    Aub.push(row); bub.push(0);
+  }
+  return { Aeq, beq, Aub, bub, nVar, profI };
+}
+
+function selfContainedElim(acts, K, prior, payoffs) {
+  const m1 = acts[0], m2 = acts[1];
+  let surv = [Array.from({ length: m1 }, (_, i) => i), Array.from({ length: m2 }, (_, i) => i)];
+  const allPlans = enumPlans(m1, m2);
+
+  for (let round = 0; round < 20; round++) {
+    const plans = filterPlans(allPlans, acts, surv);
+    if (plans.length === 0) break;
+    const { Aeq, beq, Aub, bub, nVar } = buildCEDE_LP(plans, acts, K, prior, payoffs);
+    const newSurv = [[], []];
+    for (let i = 0; i < 2; i++) for (const ai of surv[i]) {
+      const c = new Array(nVar).fill(0);
+      for (let pi = 0; pi < plans.length; pi++)
+        if (planAct(plans[pi], i) === ai) for (let th = 0; th < K; th++) c[pi * K + th] = 1;
+      const r = solveLP(c, Aub, bub, Aeq, beq);
+      if (r.status === "optimal" && r.value > 1e-8) newSurv[i].push(ai);
+    }
+    if (newSurv[0].length === surv[0].length && newSurv[1].length === surv[1].length) break;
+    surv = newSurv;
+  }
+  return surv;
+}
+
+function solveCEDE_plans(plans, acts, K, prior, payoffs, obj, sense) {
+  const m2 = acts[1], nP = plans.length;
+  const profI = (a) => a[0] * m2 + a[1];
+  const { Aeq, beq, Aub, bub, nVar } = buildCEDE_LP(plans, acts, K, prior, payoffs);
+  const c = new Array(nVar).fill(0);
+  for (let pi = 0; pi < nP; pi++) {
+    const pr = profI(planObed(plans[pi]));
+    for (let th = 0; th < K; th++) c[pi * K + th] = (sense === "max" ? 1 : -1) * obj[pr * K + th];
+  }
+  const res = solveLP(c, Aub, bub, Aeq, beq);
+  if (res.status !== "optimal") return { ...res, ep: null, ov: null, xProf: null, activePlans: [] };
+  const numProf = acts[0] * m2;
+  const xProf = new Array(numProf * K).fill(0);
+  const ep = [0, 0]; let ov = 0;
+  const weights = [];
+  for (let pi = 0; pi < nP; pi++) {
+    const pr = profI(planObed(plans[pi])); let w = 0;
+    for (let th = 0; th < K; th++) {
+      xProf[pr * K + th] += res.x[pi * K + th];
+      ep[0] += res.x[pi * K + th] * payoffs[0][pr * K + th];
+      ep[1] += res.x[pi * K + th] * payoffs[1][pr * K + th];
+      ov += res.x[pi * K + th] * obj[pr * K + th];
+      w += res.x[pi * K + th];
+    }
+    weights.push(w);
+  }
+  const activePlans = [];
+  for (let pi = 0; pi < nP; pi++) if (weights[pi] > 0.001) activePlans.push({ plan: plans[pi], weight: weights[pi] });
+  return { status: "optimal", x: res.x, xProf, ep, ov, nPlans: nP, activePlans };
+}
+
+function frontierCEDE_plans(plans, acts, K, prior, payoffs) {
+  const m2 = acts[1], nP = plans.length;
+  const profI = (a) => a[0] * m2 + a[1];
+  const { Aeq, beq, Aub, bub, nVar } = buildCEDE_LP(plans, acts, K, prior, payoffs);
+  const pay = [new Array(nVar).fill(0), new Array(nVar).fill(0)];
+  for (let pi = 0; pi < nP; pi++) {
+    const pr = profI(planObed(plans[pi]));
+    for (let th = 0; th < K; th++) { pay[0][pi * K + th] = payoffs[0][pr * K + th]; pay[1][pi * K + th] = payoffs[1][pr * K + th]; }
+  }
+  const pts = [];
+  for (let i = 0; i < 72; i++) {
+    const ang = (2 * Math.PI * i) / 72;
+    const c = new Array(nVar); for (let k = 0; k < nVar; k++) c[k] = Math.cos(ang) * pay[0][k] + Math.sin(ang) * pay[1][k];
+    const r = solveLP(c, Aub, bub, Aeq, beq);
+    if (r.status === "optimal") { let e1 = 0, e2 = 0; for (let k = 0; k < nVar; k++) { e1 += r.x[k] * pay[0][k]; e2 += r.x[k] * pay[1][k]; } pts.push([e1, e2]); }
+  }
+  const uniq = []; for (const p of pts) if (!uniq.some(q => Math.abs(q[0] - p[0]) < 1e-6 && Math.abs(q[1] - p[1]) < 1e-6)) uniq.push(p);
+  if (uniq.length <= 2) return uniq;
+  const h = cHull(uniq); return h.length >= 3 ? h : uniq;
+}
+
+/* ═══ 3-PLAYER CE-DE ═══ */
+function enumPlans3P(acts) {
+  const plans = [];
+  const perms = [[0,1,2],[0,2,1],[1,0,2],[1,2,0],[2,0,1],[2,1,0]];
+  const profI = (a) => a[0] * acts[1] * acts[2] + a[1] * acts[2] + a[2];
+
+  for (const order of perms) {
+    const [p0, p1, p2] = order;
+    const m0 = acts[p0], m1 = acts[p1], m2 = acts[p2];
+    const nf1 = Math.pow(m1, m0), nf2 = Math.pow(m2, m0 * m1);
+
+    for (let rec = 0; rec < m0; rec++) {
+      for (let f1i = 0; f1i < nf1; f1i++) {
+        const r1 = []; let t1 = f1i;
+        for (let d = 0; d < m0; d++) { r1.push(t1 % m1); t1 = Math.floor(t1 / m1); }
+
+        for (let f2i = 0; f2i < nf2; f2i++) {
+          const r2 = []; let t2 = f2i;
+          for (let d = 0; d < m0 * m1; d++) { r2.push(t2 % m2); t2 = Math.floor(t2 / m2); }
+
+          const ob = new Array(3);
+          ob[p0] = rec; ob[p1] = r1[rec]; ob[p2] = r2[rec * m1 + r1[rec]];
+          const obActs = [ob[0], ob[1], ob[2]];
+          const obProf = profI(ob);
+
+          const devProf = [{}, {}, {}];
+          for (let b = 0; b < m0; b++) {
+            if (b === rec) continue;
+            const d = [...ob]; d[p0] = b; d[p1] = r1[b]; d[p2] = r2[b * m1 + r1[b]];
+            devProf[p0][b] = profI(d);
+          }
+          for (let b = 0; b < m1; b++) {
+            if (b === r1[rec]) continue;
+            const d = [...ob]; d[p1] = b; d[p2] = r2[rec * m1 + b];
+            devProf[p1][b] = profI(d);
+          }
+          for (let b = 0; b < m2; b++) {
+            if (b === ob[p2]) continue;
+            const d = [...ob]; d[p2] = b;
+            devProf[p2][b] = profI(d);
+          }
+
+          plans.push({ order, rec, r1, r2, ob, obActs, obProf, devProf, m0, m1, m2 });
+        }
+      }
+    }
+  }
+  return plans;
+}
+
+function buildCEDE3P_LP(plans, acts, K, prior, payoffs) {
+  const nP = plans.length, nVar = nP * K;
+  const Aeq = [], beq = [];
+  for (let th = 0; th < K; th++) {
+    const row = new Array(nVar).fill(0);
+    for (let pi = 0; pi < nP; pi++) row[pi * K + th] = 1;
+    Aeq.push(row); beq.push(prior[th]);
+  }
+  const Aub = [], bub = [];
+  for (let i = 0; i < 3; i++) for (let ai = 0; ai < acts[i]; ai++) for (let bi = 0; bi < acts[i]; bi++) {
+    if (ai === bi) continue;
+    const row = new Array(nVar).fill(0);
+    for (let pi = 0; pi < nP; pi++) {
+      if (plans[pi].obActs[i] !== ai || !(bi in plans[pi].devProf[i])) continue;
+      for (let th = 0; th < K; th++)
+        row[pi * K + th] = payoffs[i][plans[pi].devProf[i][bi] * K + th] - payoffs[i][plans[pi].obProf * K + th];
+    }
+    Aub.push(row); bub.push(0);
+  }
+  return { Aeq, beq, Aub, bub, nVar };
+}
+
+function solveCEDE3P_plans(plans, acts, K, prior, payoffs, obj, sense) {
+  const nP = plans.length, numProf = acts[0] * acts[1] * acts[2];
+  const { Aeq, beq, Aub, bub, nVar } = buildCEDE3P_LP(plans, acts, K, prior, payoffs);
+  const c = new Array(nVar).fill(0);
+  for (let pi = 0; pi < nP; pi++) for (let th = 0; th < K; th++)
+    c[pi * K + th] = (sense === "max" ? 1 : -1) * obj[plans[pi].obProf * K + th];
+  const res = solveLP(c, Aub, bub, Aeq, beq);
+  if (res.status !== "optimal") return { ...res, ep: null, ov: null, xProf: null, activePlans: [] };
+  const xProf = new Array(numProf * K).fill(0);
+  const ep = [0, 0, 0]; let ov = 0; const weights = [];
+  for (let pi = 0; pi < nP; pi++) {
+    const pr = plans[pi].obProf; let w = 0;
+    for (let th = 0; th < K; th++) {
+      xProf[pr * K + th] += res.x[pi * K + th];
+      for (let i = 0; i < 3; i++) ep[i] += res.x[pi * K + th] * payoffs[i][pr * K + th];
+      ov += res.x[pi * K + th] * obj[pr * K + th]; w += res.x[pi * K + th];
+    }
+    weights.push(w);
+  }
+  const activePlans = [];
+  for (let pi = 0; pi < nP; pi++) if (weights[pi] > 0.001) activePlans.push({ plan: plans[pi], weight: weights[pi] });
+  return { status: "optimal", x: res.x, xProf, ep, ov, nPlans: nP, activePlans };
+}
+
+function filterPlans3P(plans, acts, surv) {
+  return plans.filter(p => {
+    const [p0, p1, p2] = p.order;
+    if (!surv[p0].includes(p.rec)) return false;
+    for (const v of p.r1) if (!surv[p1].includes(v)) return false;
+    for (const v of p.r2) if (!surv[p2].includes(v)) return false;
+    return true;
+  });
+}
+
+function selfContainedElim3P(acts, K, prior, payoffs) {
+  let surv = acts.map((m) => Array.from({ length: m }, (_, j) => j));
+  const allPlans = enumPlans3P(acts);
+  for (let round = 0; round < 20; round++) {
+    const plans = filterPlans3P(allPlans, acts, surv);
+    if (plans.length === 0) break;
+    const { Aeq, beq, Aub, bub, nVar } = buildCEDE3P_LP(plans, acts, K, prior, payoffs);
+    const newSurv = acts.map(() => []);
+    for (let i = 0; i < 3; i++) for (const ai of surv[i]) {
+      const c = new Array(nVar).fill(0);
+      for (let pi = 0; pi < plans.length; pi++)
+        if (plans[pi].obActs[i] === ai) for (let th = 0; th < K; th++) c[pi * K + th] = 1;
+      const r = solveLP(c, Aub, bub, Aeq, beq);
+      if (r.status === "optimal" && r.value > 1e-8) newSurv[i].push(ai);
+    }
+    if (newSurv.every((s, i) => s.length === surv[i].length)) break;
+    surv = newSurv;
+  }
+  return surv;
+}
+
+/* ═══ 2P FRONTIER ═══ */
+function frontier2P(acts, K, prior, payoffs) {
+  const numP = acts[0] * acts[1], n = numP * K;
+  const Aeq = [], beq = [];
+  for (let th = 0; th < K; th++) { const r = new Array(n).fill(0); for (let p = 0; p < numP; p++) r[p * K + th] = 1; Aeq.push(r); beq.push(prior[th]); }
+  const Aub = [], bub = [];
+  for (let a = 0; a < acts[0]; a++) for (let ap = 0; ap < acts[0]; ap++) { if (a === ap) continue; const r = new Array(n).fill(0); for (let p = 0; p < numP; p++) { if (Math.floor(p / acts[1]) !== a) continue; for (let th = 0; th < K; th++) r[p * K + th] = payoffs[0][(p + (ap - a) * acts[1]) * K + th] - payoffs[0][p * K + th]; } Aub.push(r); bub.push(0); }
+  for (let a = 0; a < acts[1]; a++) for (let ap = 0; ap < acts[1]; ap++) { if (a === ap) continue; const r = new Array(n).fill(0); for (let p = 0; p < numP; p++) { if (p % acts[1] !== a) continue; for (let th = 0; th < K; th++) r[p * K + th] = payoffs[1][(p + ap - a) * K + th] - payoffs[1][p * K + th]; } Aub.push(r); bub.push(0); }
+  const pts = [];
+  for (let i = 0; i < 72; i++) { const ang = (2 * Math.PI * i) / 72; const c = new Array(n); for (let k = 0; k < n; k++) c[k] = Math.cos(ang) * payoffs[0][k] + Math.sin(ang) * payoffs[1][k]; const r = solveLP(c, Aub, bub, Aeq, beq); if (r.status === "optimal") { let e1 = 0, e2 = 0; for (let k = 0; k < n; k++) { e1 += r.x[k] * payoffs[0][k]; e2 += r.x[k] * payoffs[1][k]; } pts.push([e1, e2]); } }
+  const uniq = []; for (const p of pts) if (!uniq.some(q => Math.abs(q[0] - p[0]) < 1e-6 && Math.abs(q[1] - p[1]) < 1e-6)) uniq.push(p);
+  if (uniq.length <= 2) return uniq;
+  const hull = cHull(uniq); return hull.length >= 3 ? hull : uniq;
+}
+
+function noInfo2P(acts, K, prior, payoffs) {
+  if (K <= 1) return null;
+  const numP = acts[0] * acts[1], avg = [new Array(numP).fill(0), new Array(numP).fill(0)];
+  for (let pi = 0; pi < 2; pi++) for (let p = 0; p < numP; p++) for (let th = 0; th < K; th++) avg[pi][p] += prior[th] * payoffs[pi][p * K + th];
+  return frontier2P(acts, 1, [1], avg);
+}
+
+/* ═══ 1P FRONTIER: (E[agent payoff], E[designer objective]) ═══ */
+function frontier1P(acts, K, prior, agentPay, designerObj) {
+  const m = acts[0], n = m * K;
+  // Build constraints: prior consistency + agent obedience
+  const Aeq = [], beq = [];
+  for (let th = 0; th < K; th++) {
+    const row = new Array(n).fill(0);
+    for (let a = 0; a < m; a++) row[a * K + th] = 1;
+    Aeq.push(row); beq.push(prior[th]);
+  }
+  const Aub = [], bub = [];
+  for (let a = 0; a < m; a++) for (let ap = 0; ap < m; ap++) {
+    if (a === ap) continue;
+    const row = new Array(n).fill(0);
+    for (let th = 0; th < K; th++)
+      row[a * K + th] = agentPay[ap * K + th] - agentPay[a * K + th];
+    Aub.push(row); bub.push(0);
+  }
+  // Sweep directions in (agent pay, designer obj) space
+  const pts = [];
+  for (let i = 0; i < 72; i++) {
+    const ang = (2 * Math.PI * i) / 72;
+    const w1 = Math.cos(ang), w2 = Math.sin(ang);
+    const c = new Array(n);
+    for (let k = 0; k < n; k++) c[k] = w1 * agentPay[k] + w2 * designerObj[k];
+    const r = solveLP(c, Aub, bub, Aeq, beq);
+    if (r.status === "optimal") {
+      let e1 = 0, e2 = 0;
+      for (let k = 0; k < n; k++) { e1 += r.x[k] * agentPay[k]; e2 += r.x[k] * designerObj[k]; }
+      pts.push([e1, e2]);
+    }
+  }
+  const uniq = []; for (const p of pts) if (!uniq.some(q => Math.abs(q[0] - p[0]) < 1e-6 && Math.abs(q[1] - p[1]) < 1e-6)) uniq.push(p);
+  if (uniq.length <= 2) return uniq;
+  const hull = cHull(uniq); return hull.length >= 3 ? hull : uniq;
+}
+
+function noInfo1P(acts, K, prior, agentPay, designerObj) {
+  // With no information, agent picks action maximizing expected payoff at the prior
+  const m = acts[0];
+  const eu = new Array(m).fill(0), ev = new Array(m).fill(0);
+  for (let a = 0; a < m; a++) for (let th = 0; th < K; th++) {
+    eu[a] += prior[th] * agentPay[a * K + th];
+    ev[a] += prior[th] * designerObj[a * K + th];
+  }
+  const maxU = Math.max(...eu);
+  // Collect all optimal actions
+  const optPts = [];
+  for (let a = 0; a < m; a++) {
+    if (Math.abs(eu[a] - maxU) < 1e-9) optPts.push([eu[a], ev[a]]);
+  }
+  return optPts;
+}
+
+function cHull(pts) {
+  const P = pts.map(p => ({ x: p[0], y: p[1] })); P.sort((a, b) => a.x - b.x || a.y - b.y);
+  const cr = (O, A, B) => (A.x - O.x) * (B.y - O.y) - (A.y - O.y) * (B.x - O.x);
+  const lo = []; for (const p of P) { while (lo.length >= 2 && cr(lo[lo.length - 2], lo[lo.length - 1], p) <= 1e-12) lo.pop(); lo.push(p); }
+  const hi = []; for (let i = P.length - 1; i >= 0; i--) { const p = P[i]; while (hi.length >= 2 && cr(hi[hi.length - 2], hi[hi.length - 1], p) <= 1e-12) hi.pop(); hi.push(p); }
+  hi.pop(); lo.pop(); return lo.concat(hi).map(p => [p.x, p.y]);
+}
+
+/* ═══ SVG DOWNLOAD ═══ */
+function dlSVG(el) { if (!el) return; const c = el.cloneNode(true); c.setAttribute("xmlns", "http://www.w3.org/2000/svg"); const b = new Blob([c.outerHTML], { type: "image/svg+xml" }); const u = URL.createObjectURL(b); const a = document.createElement("a"); a.href = u; a.download = "bce-payoff-set.svg"; document.body.appendChild(a); a.click(); document.body.removeChild(a); URL.revokeObjectURL(u); }
+
+/* ═══ PRESETS ═══ */
+function mkP(NP, acts, K, fn) { const np = acts.reduce((a, b) => a * b, 1); const r = Array.from({ length: NP }, () => new Array(np * K).fill(0)); const t = new Array(acts.length).fill(0); for (let p = 0; p < np; p++) { for (let th = 0; th < K; th++) for (let i = 0; i < NP; i++) r[i][p * K + th] = fn(i, [...t], th); for (let d = acts.length - 1; d >= 0; d--) { t[d]++; if (t[d] < acts[d]) break; t[d] = 0; } } return r; }
+function mkO(acts, K, fn) { const np = acts.reduce((a, b) => a * b, 1); const r = new Array(np * K).fill(0); const t = new Array(acts.length).fill(0); for (let p = 0; p < np; p++) { for (let th = 0; th < K; th++) r[p * K + th] = fn([...t], th); for (let d = acts.length - 1; d >= 0; d--) { t[d]++; if (t[d] < acts[d]) break; t[d] = 0; } } return r; }
+
+const PRESETS = {
+  pd: { nm: "Prisoner's Dilemma", desc: "Complete info — BCE = CE.", cat: 2, NP: 2, acts: [2, 2], K: 1, prior: [1], aL: [["Cooperate", "Defect"], ["Cooperate", "Defect"]], sL: ["---"], pay: mkP(2, [2, 2], 1, (i, t) => [[[3, 3], [0, 5]], [[5, 0], [1, 1]]][t[0]][t[1]][i]), cObj: null, dO: "welfare" },
+  bos: { nm: "Battle of the Sexes", desc: "Correlation enables fair outcomes.", cat: 2, NP: 2, acts: [2, 2], K: 1, prior: [1], aL: [["Opera", "Football"], ["Opera", "Football"]], sL: ["---"], pay: mkP(2, [2, 2], 1, (i, t) => i === 0 ? [[3, 0], [0, 1]][t[0]][t[1]] : [[1, 0], [0, 3]][t[0]][t[1]]), cObj: null, dO: "welfare" },
+  mp: { nm: "Matching Pennies", desc: "Zero-sum — no correlation advantage.", cat: 2, NP: 2, acts: [2, 2], K: 1, prior: [1], aL: [["Heads", "Tails"], ["Heads", "Tails"]], sL: ["---"], pay: mkP(2, [2, 2], 1, (i, t) => { const u = [[[1, -1], [-1, 1]], [[-1, 1], [1, -1]]]; return u[t[0]][t[1]][i]; }), cObj: null, dO: "welfare" },
+  coord: { nm: "Coordination + Uncertainty", desc: "Canonical BCE example.", cat: 2, NP: 2, acts: [2, 2], K: 2, prior: [.5, .5], aL: [["A", "B"], ["A", "B"]], sL: ["A right", "B right"], pay: mkP(2, [2, 2], 2, (i, t, th) => (t[0] === t[1] && t[0] === th) ? 2 : 0), cObj: null, dO: "welfare" },
+  bp_price: { nm: "Price Discrimination", desc: "Bayesian persuasion: seller prices, buyer values.", cat: 1, NP: 1, acts: [5], K: 5, prior: [.2, .2, .2, .2, .2], aL: [["p=1", "p=2", "p=3", "p=4", "p=5"]], sL: ["v=1", "v=2", "v=3", "v=4", "v=5"], pay: mkP(1, [5], 5, (i, t, th) => { const p = t[0] + 1, v = th + 1; return p <= v ? p : 0; }), cObj: mkO([5], 5, (t, th) => { const p = t[0] + 1, v = th + 1; return p <= v ? v : 0; }), dO: "custom" },
+  bp_jury: { nm: "Jury Persuasion", desc: "Kamenica-Gentzkow: prosecutor persuades judge.", cat: 1, NP: 1, acts: [2], K: 2, prior: [.3, .7], aL: [["Convict", "Acquit"]], sL: ["Guilty", "Innocent"], pay: mkP(1, [2], 2, (i, t, th) => ((t[0] === 0 && th === 0) || (t[0] === 1 && th === 1)) ? 1 : 0), cObj: mkO([2], 2, (t) => t[0] === 0 ? 1 : 0), dO: "custom" },
+  doval_ely: { nm: "Doval-Ely Fig. 2", desc: "3-player complete info. CE strictly larger than BCE.", cat: 3, NP: 3, acts: [3, 2, 2], K: 1, prior: [1], aL: [["d\u2081", "c\u2081", "X\u2081"], ["c\u2082", "d\u2082"], ["c\u2083", "d\u2083"]], sL: ["---"], pay: [[0,0,0,0,1,0,0,-1,-2,-2,-2,-2],[1,1,0,0,1,1,0,0,-1,2,-2,0],[1,0,1,0,1,0,1,0,-1,-2,2,0]], cObj: null, dO: "welfare" },
+};
+
+/* ═══ HELPERS ═══ */
+const S = { fontFamily: "'DM Sans', sans-serif" };
+const M = { fontFamily: "'JetBrains Mono', monospace" };
+const PCOL = ["text-amber-700", "text-blue-700", "text-emerald-700"];
+const BC = ["#fbbf24", "#93c5fd", "#6ee7b7"];
+const BG = ["#fffbeb", "#eff6ff", "#ecfdf5"];
+const TC = ["#b45309", "#2563eb", "#059669"];
+const TB = ["#92400e", "#1d4ed8", "#047857"];
+
+function HeatCell({ value, mx }) {
+  const intensity = mx > 0 ? value / mx : 0;
+  const bg = intensity > 0.01 ? `rgba(180,83,9,${0.08 + intensity * 0.55})` : "transparent";
+  return (
+    <td className="border border-stone-200 px-2 py-1.5 text-center text-xs tabular-nums" style={{ backgroundColor: bg, ...M }}>
+      {value.toFixed(4)}
+    </td>
+  );
+}
+
+/* ═══ PAYOFF PLOT ═══ */
+function PayoffPlot({ fr, ni, bceFr, scFr, cp, label, nS, xLabel, yLabel }) {
+  const ref = useRef(null);
+  if (!fr || fr.length === 0) return null;
+  const W = 520, H = 420, p = { t: 30, r: 30, b: 55, l: 60 };
+  const pw = W - p.l - p.r, ph = H - p.t - p.b;
+  const all = [...fr]; if (ni) all.push(...ni); if (bceFr) all.push(...bceFr); if (scFr) all.push(...scFr); if (cp) all.push(cp);
+  let x0 = Math.min(...all.map(v => v[0])), x1 = Math.max(...all.map(v => v[0]));
+  let y0 = Math.min(...all.map(v => v[1])), y1 = Math.max(...all.map(v => v[1]));
+  const xr = (x1 - x0) || 1, yr = (y1 - y0) || 1;
+  x0 -= xr * .15; x1 += xr * .15; y0 -= yr * .15; y1 += yr * .15;
+  const sx = v => p.l + ((v - x0) / (x1 - x0)) * pw;
+  const sy = v => p.t + ph - ((v - y0) / (y1 - y0)) * ph;
+  const tk = (lo, hi) => Array.from({ length: 5 }, (_, i) => lo + (i / 4) * (hi - lo));
+  const isPoly = fr.length >= 3, isLine = fr.length === 2, isPoint = fr.length === 1;
+  const showNi = nS > 1 && ni && ni.length > 0;
+  const showBce = bceFr && bceFr.length > 0;
+  const showSc = scFr && scFr.length > 0;
+  const bceIsPoly = showBce && bceFr.length >= 3;
+  const bceIsLine = showBce && bceFr.length === 2;
+  const scIsPoly = showSc && scFr.length >= 3;
+
+  const desc = showSc
+    ? "Amber = self-contained CE. Dashed orange = full CE (incl. non-credible threats). Dashed purple = BCE."
+    : showBce
+    ? "Amber = CE set (Doval-Ely). Dashed purple = BCE (simultaneous). Gap = value of sequential design."
+    : isPoint ? "Single-point set."
+    : isLine ? "Line segment set."
+    : showNi ? "Amber = BCE set. Dashed blue = CE at prior."
+    : "Shaded region = achievable payoffs.";
+
+  return (
+    <div className="bg-white rounded-xl border border-stone-200 p-5 shadow-sm">
+      <h3 className="text-sm font-semibold uppercase tracking-widest text-stone-400 mb-1" style={S}>{showBce ? "Payoff Set Comparison" : "Payoff Set"}</h3>
+      <p className="text-xs text-stone-500 mb-4" style={S}>{desc}</p>
+      <div className="flex justify-center">
+        <svg ref={ref} width={W} height={H} viewBox={`0 0 ${W} ${H}`} className="max-w-full" style={S}>
+          {tk(x0, x1).map((v, i) => (
+            <g key={"x" + i}>
+              <line x1={sx(v)} y1={p.t} x2={sx(v)} y2={p.t + ph} stroke="#e7e5e4" />
+              <text x={sx(v)} y={H - p.b + 18} textAnchor="middle" fontSize={10} fill="#a8a29e">{v.toFixed(2)}</text>
+            </g>
+          ))}
+          {tk(y0, y1).map((v, i) => (
+            <g key={"y" + i}>
+              <line x1={p.l} y1={sy(v)} x2={p.l + pw} y2={sy(v)} stroke="#e7e5e4" />
+              <text x={p.l - 8} y={sy(v) + 3} textAnchor="end" fontSize={10} fill="#a8a29e">{v.toFixed(2)}</text>
+            </g>
+          ))}
+          <line x1={p.l} y1={p.t} x2={p.l} y2={p.t + ph} stroke="#78716c" strokeWidth={1.5} />
+          <line x1={p.l} y1={p.t + ph} x2={p.l + pw} y2={p.t + ph} stroke="#78716c" strokeWidth={1.5} />
+          <text x={p.l + pw / 2} y={H - 6} textAnchor="middle" fontSize={12} fill="#57534e" fontWeight={500}>{xLabel || "E[u1]"}</text>
+          <text x={14} y={p.t + ph / 2} textAnchor="middle" fontSize={12} fill="#57534e" fontWeight={500} transform={`rotate(-90,14,${p.t + ph / 2})`}>{yLabel || "E[u2]"}</text>
+          {isPoly && <polygon points={fr.map(v => `${sx(v[0])},${sy(v[1])}`).join(" ")} fill="rgba(180,83,9,.12)" stroke="#b45309" strokeWidth={2} strokeLinejoin="round" />}
+          {isLine && <line x1={sx(fr[0][0])} y1={sy(fr[0][1])} x2={sx(fr[1][0])} y2={sy(fr[1][1])} stroke="#b45309" strokeWidth={3} strokeLinecap="round" />}
+          {isPoint && <circle cx={sx(fr[0][0])} cy={sy(fr[0][1])} r={6} fill="rgba(180,83,9,.3)" stroke="#b45309" strokeWidth={2} />}
+          {showNi && ni.length >= 3 && <polygon points={ni.map(v => `${sx(v[0])},${sy(v[1])}`).join(" ")} fill="rgba(37,99,235,.08)" stroke="#2563eb" strokeWidth={2} strokeDasharray="6,4" strokeLinejoin="round" />}
+          {showNi && ni.length === 2 && <line x1={sx(ni[0][0])} y1={sy(ni[0][1])} x2={sx(ni[1][0])} y2={sy(ni[1][1])} stroke="#2563eb" strokeWidth={2} strokeDasharray="6,4" />}
+          {showBce && bceIsPoly && <polygon points={bceFr.map(v => `${sx(v[0])},${sy(v[1])}`).join(" ")} fill="rgba(124,58,237,.06)" stroke="#7c3aed" strokeWidth={2} strokeDasharray="5,3" strokeLinejoin="round" />}
+          {showBce && bceIsLine && <line x1={sx(bceFr[0][0])} y1={sy(bceFr[0][1])} x2={sx(bceFr[1][0])} y2={sy(bceFr[1][1])} stroke="#7c3aed" strokeWidth={2} strokeDasharray="5,3" />}
+          {showBce && bceFr.length === 1 && <circle cx={sx(bceFr[0][0])} cy={sy(bceFr[0][1])} r={5} fill="rgba(124,58,237,.15)" stroke="#7c3aed" strokeWidth={2} strokeDasharray="4,3" />}
+          {showSc && scIsPoly && <polygon points={scFr.map(v => `${sx(v[0])},${sy(v[1])}`).join(" ")} fill="none" stroke="#ea580c" strokeWidth={2} strokeDasharray="8,4" strokeLinejoin="round" />}
+          {fr.map((v, i) => <circle key={i} cx={sx(v[0])} cy={sy(v[1])} r={2.5} fill="#b45309" opacity={0.5} />)}
+          {cp && (
+            <g>
+              <circle cx={sx(cp[0])} cy={sy(cp[1])} r={7} fill="#fff" stroke="#1c1917" strokeWidth={2.5} />
+              <circle cx={sx(cp[0])} cy={sy(cp[1])} r={3} fill="#1c1917" />
+              <text x={sx(cp[0]) + 12} y={sy(cp[1]) - 8} fontSize={11} fill="#1c1917" fontWeight={600}>{label}</text>
+            </g>
+          )}
+          {(showNi || showBce || showSc) && (
+            <g transform={`translate(${p.l + 8},${p.t + 8})`}>
+              <rect width={200} height={showSc ? 74 : showBce ? 58 : 42} rx={4} fill="rgba(255,255,255,.92)" stroke="#e7e5e4" />
+              <rect x={8} y={8} width={14} height={10} rx={2} fill="rgba(180,83,9,.15)" stroke="#b45309" strokeWidth={1.5} />
+              <text x={28} y={17} fontSize={10} fill="#57534e">{showSc ? "Self-contained CE" : showBce ? "CE (Doval-Ely)" : "BCE set"}</text>
+              {showSc && <>
+                <rect x={8} y={24} width={14} height={10} rx={2} fill="none" stroke="#ea580c" strokeWidth={1.5} strokeDasharray="3,2" />
+                <text x={28} y={33} fontSize={10} fill="#57534e">Full CE (all threats)</text>
+              </>}
+              {showBce && <>
+                <rect x={8} y={showSc ? 40 : 24} width={14} height={10} rx={2} fill="rgba(124,58,237,.08)" stroke="#7c3aed" strokeWidth={1.5} strokeDasharray="3,2" />
+                <text x={28} y={showSc ? 49 : 33} fontSize={10} fill="#57534e">BCE (simultaneous)</text>
+              </>}
+              {showNi && <>
+                <rect x={8} y={showSc ? 56 : showBce ? 40 : 24} width={14} height={10} rx={2} fill="rgba(37,99,235,.1)" stroke="#2563eb" strokeWidth={1.5} strokeDasharray="3,2" />
+                <text x={28} y={showSc ? 65 : showBce ? 49 : 33} fontSize={10} fill="#57534e">CE at prior (no info)</text>
+              </>}
+            </g>
+          )}
+        </svg>
+      </div>
+      <div className="flex justify-end mt-2">
+        <button onClick={() => dlSVG(ref.current)} className="text-xs text-stone-400 hover:text-stone-600 flex items-center gap-1" style={S}>Download SVG</button>
+      </div>
+    </div>
+  );
+}
+
+/* ═══ URL ═══ */
+function encH(s) { try { return btoa(JSON.stringify(s)); } catch { return ""; } }
+function decH(h) { try { const r = h.startsWith("#") ? h.slice(1) : h; if (!r) return null; const c = JSON.parse(atob(r)); return c.a ? c : null; } catch { return null; } }
+
+/* ═══ APP ═══ */
+function App() {
+  const maxA = (np) => (np === 1 ? 15 : np === 2 ? 8 : 4);
+  const maxK = (np) => (np === 1 ? 15 : np === 2 ? 8 : 4);
+
+  const [NP, setNP] = useState(2);
+  const [acts, setActs] = useState([2, 2]);
+  const [K, setK] = useState(2);
+  const [prior, setPrior] = useState([0.5, 0.5]);
+  const [payoffs, setPayoffs] = useState(() => PRESETS.coord.pay.map(a => [...a]));
+  const [cObj, setCObj] = useState(() => new Array(8).fill(0));
+  const [aL, setAL] = useState([["A", "B"], ["A", "B"]]);
+  const [sL, setSL] = useState(["A right", "B right"]);
+  const [objType, setObjType] = useState("welfare");
+  const [objSense, setObjSense] = useState("max");
+  const [concept, setConcept] = useState("bce");
+  const [pk, setPK] = useState("coord");
+  const [tab, setTab] = useState("setup");
+  const [res, setRes] = useState(null);
+  const [fr, setFr] = useState(null);
+  const [ni, setNi] = useState(null);
+  const [bceFr, setBceFr] = useState(null);
+  const [scFr, setScFr] = useState(null);
+  const [survActs, setSurvActs] = useState(null);
+  const [showDist, setShowDist] = useState(false);
+  const [showPlans, setShowPlans] = useState(false);
+  const [showLP, setShowLP] = useState(false);
+  const [shareUrl, setShareUrl] = useState(null);
+  const shareRef = useRef(null);
+
+  const numProf = acts.reduce((a, b) => a * b, 1);
+  const n = numProf * K;
+
+  const loadPreset = useCallback((key) => {
+    const p = PRESETS[key]; if (!p) return;
+    setNP(p.NP); setActs([...p.acts]); setK(p.K); setPrior([...p.prior]);
+    setPayoffs(p.pay.map(a => [...a]));
+    setCObj(p.cObj ? [...p.cObj] : new Array(p.acts.reduce((a, b) => a * b, 1) * p.K).fill(0));
+    setAL(p.aL.map(a => [...a])); setSL([...p.sL]); setObjType(p.dO); setPK(key);
+    setRes(null); setFr(null); setNi(null); setShareUrl(null);
+  }, []);
+
+  const initDims = useCallback((np, a, k) => {
+    const sz = a.reduce((x, y) => x * y, 1) * k;
+    setPayoffs(Array.from({ length: np }, () => new Array(sz).fill(0)));
+    setCObj(new Array(sz).fill(0));
+    const pr = Array(k).fill(+(1 / k).toFixed(4)); pr[0] = +(1 - pr.slice(1).reduce((x, y) => x + y, 0)).toFixed(4);
+    setPrior(pr);
+    setAL(a.map((m, i) => Array.from({ length: m }, (_, j) => np === 1 ? `a${j + 1}` : `${String.fromCharCode(97 + i)}${j + 1}`)));
+    setSL(k === 1 ? ["---"] : Array.from({ length: k }, (_, i) => `s${i + 1}`));
+    setPK(null); setRes(null); setFr(null); setNi(null); setShareUrl(null);
+  }, []);
+
+  const chgNP = (np) => { setNP(np); const a = Array(np).fill(2); setActs(a); const k = Math.min(K, maxK(np)); setK(k); initDims(np, a, k); };
+  const chgAct = (pi, m) => { const a = [...acts]; a[pi] = m; setActs(a); initDims(NP, a, K); };
+  const chgK = (k) => { setK(k); initDims(NP, acts, k); };
+  const updP = (pl, fi, v) => setPayoffs(p => { const c = p.map(a => [...a]); c[pl][fi] = v; return c; });
+  const updC = (fi, v) => setCObj(p => { const c = [...p]; c[fi] = v; return c; });
+
+  useEffect(() => {
+    const d = decH(window.location.hash);
+    if (d) { setNP(d.np); setActs(d.a); setK(d.k); setPrior(d.p); setPayoffs(d.py.map(a => [...a])); setCObj(d.co ? [...d.co] : new Array(d.a.reduce((x, y) => x * y, 1) * d.k).fill(0)); setAL(d.al.map(a => [...a])); setSL([...d.sl]); setObjType(d.ot); setObjSense(d.os); setPK(null); }
+  }, []);
+
+  const buildObj = () => {
+    const o = new Array(n).fill(0);
+    if (objType === "welfare") { for (let k = 0; k < n; k++) for (let i = 0; i < NP; i++) o[k] += payoffs[i][k]; }
+    else if (objType === "custom") { for (let k = 0; k < n; k++) o[k] = cObj[k]; }
+    else { const pi = parseInt(objType.replace("player", "")) - 1; for (let k = 0; k < n; k++) o[k] = payoffs[pi][k]; }
+    return o;
+  };
+
+  const handleSolve = () => {
+    const pS = prior.reduce((a, b) => a + b, 0);
+    const np = prior.map(p => p / pS);
+    const obj = buildObj();
+
+    setBceFr(null); setScFr(null); setSurvActs(null);
+
+    if (concept === "cede" && NP === 2) {
+      const allPlans = enumPlans(acts[0], acts[1]);
+      const result = solveCEDE_plans(allPlans, acts, K, np, payoffs, obj, objSense);
+      setRes({ ...result, x: result.xProf || result.x });
+      setFr(frontierCEDE_plans(allPlans, acts, K, np, payoffs));
+      setBceFr(frontier2P(acts, K, np, payoffs));
+      setNi(noInfo2P(acts, K, np, payoffs));
+    } else if (concept === "scce" && NP === 2) {
+      const surv = selfContainedElim(acts, K, np, payoffs);
+      setSurvActs(surv);
+      const allPlans = enumPlans(acts[0], acts[1]);
+      const scPlans = filterPlans(allPlans, acts, surv);
+      const result = solveCEDE_plans(scPlans, acts, K, np, payoffs, obj, objSense);
+      setRes({ ...result, x: result.xProf || result.x });
+      setFr(frontierCEDE_plans(scPlans, acts, K, np, payoffs));
+      setBceFr(frontier2P(acts, K, np, payoffs));
+      setScFr(frontierCEDE_plans(allPlans, acts, K, np, payoffs));
+      setNi(noInfo2P(acts, K, np, payoffs));
+    } else if (concept === "cede" && NP === 3) {
+      const allPlans = enumPlans3P(acts);
+      const result = solveCEDE3P_plans(allPlans, acts, K, np, payoffs, obj, objSense);
+      setRes({ ...result, x: result.xProf || result.x });
+      setFr(null); setNi(null);
+    } else if (concept === "scce" && NP === 3) {
+      const surv = selfContainedElim3P(acts, K, np, payoffs);
+      setSurvActs(surv);
+      const allPlans = enumPlans3P(acts);
+      const scPlans = filterPlans3P(allPlans, acts, surv);
+      const result = solveCEDE3P_plans(scPlans, acts, K, np, payoffs, obj, objSense);
+      setRes({ ...result, x: result.xProf || result.x });
+      setFr(null); setNi(null);
+    } else {
+      const result = solveBCE(NP, acts, K, np, payoffs, obj, objSense);
+      setRes(result);
+      if (NP === 2) { setFr(frontier2P(acts, K, np, payoffs)); setNi(noInfo2P(acts, K, np, payoffs)); }
+      else if (NP === 1 && objType === "custom") { setFr(frontier1P(acts, K, np, payoffs[0], cObj)); setNi(noInfo1P(acts, K, np, payoffs[0], cObj)); }
+      else { setFr(null); setNi(null); }
+    }
+    try { const h = encH({ np: NP, a: acts, k: K, p: prior, py: payoffs, co: objType === "custom" ? cObj : null, al: aL, sl: sL, ot: objType, os: objSense, cc: concept }); if (h) window.history.replaceState(null, "", "#" + h); } catch (e) { /* */ }
+    setTab("results");
+  };
+
+  const handleShare = () => {
+    if (shareUrl) { setShareUrl(null); return; }
+    const h = encH({ np: NP, a: acts, k: K, p: prior, py: payoffs, co: objType === "custom" ? cObj : null, al: aL, sl: sL, ot: objType, os: objSense });
+    if (h) { setShareUrl("https://YOUR-SITE.github.io/info-design-toolkit/index.html#" + h); setTimeout(() => { if (shareRef.current) shareRef.current.select(); }, 50); }
+  };
+
+  const objLbl = objType === "welfare" ? "welfare" : objType === "custom" ? "custom" : `P${objType.replace("player", "")}`;
+  const maxD = res && res.x ? Math.max(...res.x) : 0;
+  const priorSum = prior.reduce((a, b) => a + b, 0);
+
+  // Render payoff input for a single cell
+  const payInput = (player, fi, color) => (
+    <input type="number" step="any" value={payoffs[player] ? payoffs[player][fi] || 0 : 0}
+      onChange={e => updP(player, fi, parseFloat(e.target.value) || 0)}
+      className={`w-12 text-center text-sm bg-transparent outline-none ${color}`} style={M} />
+  );
+
+  return (
+    <div className="min-h-screen" style={{ background: "linear-gradient(175deg,#fafaf9 0%,#f5f0eb 40%,#ede8e1 100%)", fontFamily: "'Source Serif 4','Georgia',serif" }}>
+      <link href="https://fonts.googleapis.com/css2?family=Source+Serif+4:opsz,wght@8..60,300;8..60,400;8..60,600;8..60,700&family=JetBrains+Mono:wght@400;500&family=DM+Sans:wght@400;500;600&display=swap" rel="stylesheet" />
+
+      <header className="border-b border-stone-300" style={{ background: "rgba(255,255,255,.6)", backdropFilter: "blur(12px)" }}>
+        <div className="max-w-6xl mx-auto px-6 py-5">
+          <h1 className="text-2xl font-bold text-stone-900 tracking-tight">Information Design Toolkit</h1>
+          <p className="text-sm text-stone-500 mt-1" style={S}>Compute BCE, coordinated equilibria, and Bayesian persuasion for 1–3 player games. Runs in your browser.</p>
+        </div>
+      </header>
+
+      <div className="max-w-6xl mx-auto px-6 py-6">
+        {/* Intro */}
+        <div className="mb-6 p-4 rounded-xl border border-stone-200 bg-white/60" style={S}>
+          <p className="text-sm text-stone-600 leading-relaxed">
+            <strong className="text-stone-800">What is this?</strong> This toolkit computes optimal outcomes under different solution concepts from the information design literature: Bayes Correlated Equilibrium (Bergemann-Morris), Coordinated Equilibrium (Doval-Ely), its self-contained refinement, and Bayesian persuasion (Kamenica-Gentzkow). You can optimize any linear objective v(a, state) over the feasible set.
+          </p>
+        </div>
+
+        {/* Tabs + Share */}
+        <div className="flex items-center justify-between mb-6 flex-wrap gap-3">
+          <div className="flex gap-1 p-1 rounded-lg w-fit" style={{ background: "rgba(0,0,0,.06)" }}>
+            {["setup", "results"].map(k => (
+              <button key={k} onClick={() => setTab(k)} className={`px-5 py-2 rounded-md text-sm font-medium transition-all ${tab === k ? "bg-white text-stone-900 shadow-sm" : "text-stone-500 hover:text-stone-700"}`} style={S}>
+                {k === "setup" ? "Game Setup" : "Results"}
+              </button>
+            ))}
+          </div>
+          <button onClick={handleShare} className="px-4 py-2 rounded-lg text-sm font-medium border flex items-center gap-2" style={{ ...S, borderColor: shareUrl ? "#b45309" : "#d6d3d1", color: shareUrl ? "#92400e" : "#78716c", backgroundColor: shareUrl ? "#fffbeb" : "white" }}>
+            {shareUrl ? "Hide Link" : "Share This Game"}
+          </button>
+        </div>
+
+        {shareUrl && (
+          <div className="mb-6 p-4 rounded-xl border border-amber-200 bg-amber-50/50" style={S}>
+            <p className="text-xs text-stone-500 mb-2">Copy this link to share:</p>
+            <input ref={shareRef} type="text" readOnly value={shareUrl} onClick={e => e.target.select()} className="w-full px-3 py-2 rounded-lg border border-stone-300 bg-white text-xs text-stone-700 outline-none" style={M} />
+          </div>
+        )}
+
+        {/* ═══ SETUP ═══ */}
+        {tab === "setup" && (
+          <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+            <div className="lg:col-span-1 space-y-4">
+              {/* Players */}
+              <div className="bg-white rounded-xl border border-stone-200 p-5 shadow-sm">
+                <h2 className="text-sm font-semibold uppercase tracking-widest text-stone-400 mb-3" style={S}>Players</h2>
+                <div className="flex gap-2">
+                  {[1, 2, 3].map(np => (
+                    <button key={np} onClick={() => chgNP(np)} className={`flex-1 py-2 rounded-lg text-sm font-medium border ${NP === np ? "bg-stone-900 text-white border-stone-900" : "bg-white text-stone-600 border-stone-300"}`} style={S}>
+                      {np === 1 ? "1 (Persuasion)" : np}
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              {/* Solution Concept (2P, or 3P with small actions) */}
+              {(NP === 2 || (NP === 3 && (() => { const perms=[[0,1,2],[0,2,1],[1,0,2],[1,2,0],[2,0,1],[2,1,0]]; let t=0; for(const[p0,p1,p2]of perms)t+=acts[p0]*Math.pow(acts[p1],acts[p0])*Math.pow(acts[p2],acts[p0]*acts[p1]); return t<=10000; })())) && (
+                <div className="bg-white rounded-xl border border-stone-200 p-5 shadow-sm">
+                  <h2 className="text-sm font-semibold uppercase tracking-widest text-stone-400 mb-3" style={S}>Solution Concept</h2>
+                  <div className="space-y-1.5">
+                    {[
+                      ["bce", "BCE", "Simultaneous moves, varying info"],
+                      ["cede", "Coordinated Equilibrium", "Varying extensive form + info"],
+                      ["scce", "Self-Contained CE", "Credible threats only"],
+                    ].map(([k, l, d]) => (
+                      <button key={k} onClick={() => { setConcept(k); setRes(null); setFr(null); setNi(null); setBceFr(null); setScFr(null); setSurvActs(null); }}
+                        className={`w-full text-left px-3 py-2 rounded-lg border text-sm ${concept === k ? "border-amber-400 bg-amber-50 ring-1 ring-amber-200" : "border-stone-200 hover:border-stone-300 bg-white"}`} style={S}>
+                        <span className="font-semibold text-stone-800">{l}</span>
+                        <span className="text-xs text-stone-500 ml-2">{d}</span>
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              {/* Presets */}
+              <div className="bg-white rounded-xl border border-stone-200 p-5 shadow-sm">
+                <h2 className="text-sm font-semibold uppercase tracking-widest text-stone-400 mb-3" style={S}>Presets</h2>
+                <div className="space-y-2">
+                  {Object.entries(PRESETS).filter(([_, p]) => p.cat === NP).map(([key, p]) => (
+                    <button key={key} onClick={() => loadPreset(key)} className={`w-full text-left px-4 py-3 rounded-lg border text-sm ${pk === key ? "border-amber-400 bg-amber-50 ring-1 ring-amber-200" : "border-stone-200 hover:border-stone-300 bg-white"}`} style={S}>
+                      <div className="font-semibold text-stone-800">{p.nm}</div>
+                      <div className="text-xs text-stone-500 mt-0.5">{p.desc}</div>
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              {/* Dimensions */}
+              <div className="bg-white rounded-xl border border-stone-200 p-5 shadow-sm">
+                <h2 className="text-sm font-semibold uppercase tracking-widest text-stone-400 mb-3" style={S}>Dimensions</h2>
+                <div className="space-y-3" style={S}>
+                  {acts.map((m, i) => (
+                    <div key={i}>
+                      <label className="block text-xs text-stone-500 mb-1">{NP === 1 ? "Actions" : `P${i + 1} Actions`}</label>
+                      <select value={m} onChange={e => chgAct(i, +e.target.value)} className="w-full px-2 py-1.5 rounded border border-stone-300 text-sm bg-white">
+                        {Array.from({ length: maxA(NP) - 1 }, (_, j) => j + 2).map(v => <option key={v} value={v}>{v}</option>)}
+                      </select>
+                    </div>
+                  ))}
+                  <div>
+                    <label className="block text-xs text-stone-500 mb-1">States</label>
+                    <select value={K} onChange={e => chgK(+e.target.value)} className="w-full px-2 py-1.5 rounded border border-stone-300 text-sm bg-white">
+                      {Array.from({ length: maxK(NP) }, (_, j) => j + 1).map(v => <option key={v} value={v}>{v}</option>)}
+                    </select>
+                  </div>
+                </div>
+              </div>
+
+              {/* Objective */}
+              <div className="bg-white rounded-xl border border-stone-200 p-5 shadow-sm">
+                <h2 className="text-sm font-semibold uppercase tracking-widest text-stone-400 mb-3" style={S}>Objective</h2>
+                <div className="space-y-3" style={S}>
+                  <select value={objType} onChange={e => setObjType(e.target.value)} className="w-full px-2 py-1.5 rounded border border-stone-300 text-sm bg-white">
+                    {NP > 1 && <option value="welfare">Social Welfare</option>}
+                    {Array.from({ length: NP }, (_, i) => (
+                      <option key={i} value={`player${i + 1}`}>{NP === 1 ? "Agent Payoff" : `Player ${i + 1} Payoff`}</option>
+                    ))}
+                    <option value="custom">Custom Objective v(a, state)</option>
+                  </select>
+                  <div className="flex gap-2">
+                    {["max", "min"].map(s => (
+                      <button key={s} onClick={() => setObjSense(s)} className={`flex-1 py-2 rounded-lg text-sm font-medium border ${objSense === s ? "bg-stone-900 text-white border-stone-900" : "bg-white text-stone-600 border-stone-300"}`}>
+                        {s === "max" ? "Maximize" : "Minimize"}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              </div>
+
+              <button onClick={handleSolve} className="w-full py-3 rounded-xl text-white font-semibold text-sm shadow-md hover:shadow-lg active:scale-[0.98]" style={{ ...S, background: "linear-gradient(135deg,#92400e,#b45309)" }}>
+                {(concept === "cede" ? "Compute Coordinated Equilibrium" : concept === "scce" ? "Compute Self-Contained CE" : NP === 1 ? "Compute Persuasion" : "Compute BCE")}
+              </button>
+            </div>
+
+            {/* Right: payoff input */}
+            <div className="lg:col-span-2 space-y-4">
+              {/* Prior */}
+              <div className="bg-white rounded-xl border border-stone-200 p-5 shadow-sm">
+                <div className="flex items-center justify-between mb-3">
+                  <h2 className="text-sm font-semibold uppercase tracking-widest text-stone-400" style={S}>Prior</h2>
+                  {Math.abs(priorSum - 1) > 0.01 && <span className="text-xs text-red-500" style={S}>Sum = {priorSum.toFixed(3)}</span>}
+                </div>
+                <div className="flex gap-2 flex-wrap">
+                  {prior.map((p, i) => (
+                    <div key={i} className="flex-1 min-w-[60px]">
+                      <label className="block text-xs text-stone-500 mb-1 text-center" style={S}>{sL[i]}</label>
+                      <input type="number" step="any" value={p} onChange={e => setPrior(pr => { const c = [...pr]; c[i] = parseFloat(e.target.value) || 0; return c; })}
+                        className="w-full px-2 py-1.5 rounded border text-sm text-center bg-white border-stone-300 text-stone-900 focus:border-amber-500 outline-none" />
+                    </div>
+                  ))}
+                </div>
+              </div>
+
+              {/* 1P Payoffs */}
+              {NP === 1 && (
+                <div className="bg-white rounded-xl border border-stone-200 p-5 shadow-sm">
+                  <h2 className="text-sm font-semibold text-stone-700 mb-3" style={S}>Agent Payoff u(a, state)</h2>
+                  <div className="overflow-x-auto">
+                    <table className="border-collapse text-sm" style={S}>
+                      <thead>
+                        <tr>
+                          <th className="p-2 text-stone-400 text-xs">Action / State</th>
+                          {sL.map((l, j) => <th key={j} className="p-2 text-center text-xs font-semibold text-stone-600">{l}</th>)}
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {Array.from({ length: acts[0] }, (_, a) => (
+                          <tr key={a}>
+                            <td className="p-2 text-right text-xs font-semibold text-stone-600">{aL[0] && aL[0][a] ? aL[0][a] : `a${a + 1}`}</td>
+                            {Array.from({ length: K }, (_, th) => (
+                              <td key={th} className="p-1">
+                                <input type="number" step="any" value={payoffs[0] ? payoffs[0][a * K + th] || 0 : 0}
+                                  onChange={e => updP(0, a * K + th, parseFloat(e.target.value) || 0)}
+                                  className="w-16 text-center text-sm bg-stone-50 rounded border border-stone-200 outline-none focus:border-amber-500 text-amber-700 px-1 py-1" style={M} />
+                              </td>
+                            ))}
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+              )}
+
+              {/* 2P Payoffs */}
+              {NP === 2 && Array.from({ length: K }, (_, th) => (
+                <div key={th} className="bg-white rounded-xl border border-stone-200 p-5 shadow-sm">
+                  <h2 className="text-sm font-semibold text-stone-700 mb-3" style={S}>
+                    {K === 1 ? "Payoff Matrix" : `State: ${sL[th]}`}
+                    {K > 1 && <span className="text-stone-400 font-normal ml-2">prior = {prior[th]}</span>}
+                  </h2>
+                  <div className="overflow-x-auto">
+                    <table className="border-collapse text-sm" style={S}>
+                      <thead>
+                        <tr>
+                          <th className="p-2 text-stone-400 text-xs">P1 / P2</th>
+                          {Array.from({ length: acts[1] }, (_, j) => <th key={j} className="p-2 text-center text-xs font-semibold text-stone-600">{aL[1] && aL[1][j] ? aL[1][j] : `b${j + 1}`}</th>)}
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {Array.from({ length: acts[0] }, (_, a1) => (
+                          <tr key={a1}>
+                            <td className="p-2 text-right text-xs font-semibold text-stone-600">{aL[0] && aL[0][a1] ? aL[0][a1] : `a${a1 + 1}`}</td>
+                            {Array.from({ length: acts[1] }, (_, a2) => {
+                              const fi = (a1 * acts[1] + a2) * K + th;
+                              return (
+                                <td key={a2} className="p-1">
+                                  <div className="flex items-center gap-1 bg-stone-50 rounded-lg px-2 py-1 border border-stone-200">
+                                    {payInput(0, fi, "text-amber-700")}
+                                    <span className="text-stone-300">,</span>
+                                    {payInput(1, fi, "text-blue-700")}
+                                  </div>
+                                </td>
+                              );
+                            })}
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                    <div className="flex gap-4 mt-2 text-xs text-stone-400" style={S}>
+                      <span><span className="inline-block w-3 h-3 rounded bg-amber-100 border border-amber-300 mr-1 align-middle" /> P1</span>
+                      <span><span className="inline-block w-3 h-3 rounded bg-blue-100 border border-blue-300 mr-1 align-middle" /> P2</span>
+                    </div>
+                  </div>
+                </div>
+              ))}
+
+              {/* 3P Payoffs */}
+              {NP === 3 && Array.from({ length: K }, (_, th) => (
+                <div key={th} className="bg-white rounded-xl border border-stone-200 p-5 shadow-sm">
+                  <h2 className="text-sm font-semibold text-stone-700 mb-3" style={S}>
+                    {K === 1 ? "Payoff Matrices" : `State: ${sL[th]}`}
+                  </h2>
+                  <div className="space-y-4">
+                    {Array.from({ length: acts[2] }, (_, a3) => (
+                      <div key={a3}>
+                        <div className="text-xs font-medium text-stone-500 mb-2" style={S}>P3 plays: <span className="font-semibold text-stone-700">{aL[2] && aL[2][a3] ? aL[2][a3] : `c${a3 + 1}`}</span></div>
+                        <div className="overflow-x-auto">
+                          <table className="border-collapse text-sm" style={S}>
+                            <thead>
+                              <tr>
+                                <th className="p-2 text-stone-400 text-xs">P1/P2</th>
+                                {Array.from({ length: acts[1] }, (_, j) => <th key={j} className="p-2 text-center text-xs font-semibold text-stone-600">{aL[1] && aL[1][j] ? aL[1][j] : `b${j + 1}`}</th>)}
+                              </tr>
+                            </thead>
+                            <tbody>
+                              {Array.from({ length: acts[0] }, (_, a1) => (
+                                <tr key={a1}>
+                                  <td className="p-2 text-right text-xs font-semibold text-stone-600">{aL[0] && aL[0][a1] ? aL[0][a1] : `a${a1 + 1}`}</td>
+                                  {Array.from({ length: acts[1] }, (_, a2) => {
+                                    const fi = (a1 * acts[1] * acts[2] + a2 * acts[2] + a3) * K + th;
+                                    return (
+                                      <td key={a2} className="p-1">
+                                        <div className="flex items-center gap-0.5 bg-stone-50 rounded px-1 py-1 border border-stone-200 text-xs" style={M}>
+                                          <input type="number" step="any" value={payoffs[0] ? payoffs[0][fi] || 0 : 0} onChange={e => updP(0, fi, parseFloat(e.target.value) || 0)} className="w-10 text-center bg-transparent outline-none text-amber-700" />
+                                          <span className="text-stone-300">,</span>
+                                          <input type="number" step="any" value={payoffs[1] ? payoffs[1][fi] || 0 : 0} onChange={e => updP(1, fi, parseFloat(e.target.value) || 0)} className="w-10 text-center bg-transparent outline-none text-blue-700" />
+                                          <span className="text-stone-300">,</span>
+                                          <input type="number" step="any" value={payoffs[2] ? payoffs[2][fi] || 0 : 0} onChange={e => updP(2, fi, parseFloat(e.target.value) || 0)} className="w-10 text-center bg-transparent outline-none text-emerald-700" />
+                                        </div>
+                                      </td>
+                                    );
+                                  })}
+                                </tr>
+                              ))}
+                            </tbody>
+                          </table>
+                        </div>
+                      </div>
+                    ))}
+                    <div className="flex gap-4 text-xs text-stone-400" style={S}>
+                      <span><span className="inline-block w-3 h-3 rounded bg-amber-100 border border-amber-300 mr-1 align-middle" /> P1</span>
+                      <span><span className="inline-block w-3 h-3 rounded bg-blue-100 border border-blue-300 mr-1 align-middle" /> P2</span>
+                      <span><span className="inline-block w-3 h-3 rounded bg-emerald-100 border border-emerald-300 mr-1 align-middle" /> P3</span>
+                    </div>
+                  </div>
+                </div>
+              ))}
+
+              {/* Custom Objective */}
+              {objType === "custom" && (
+                <div className="bg-white rounded-xl border border-stone-200 p-5 shadow-sm ring-1 ring-amber-200">
+                  <h2 className="text-sm font-semibold text-amber-800 mb-1" style={S}>Custom Objective v(a, state)</h2>
+                  <p className="text-xs text-stone-500 mb-3" style={S}>The solver will {objSense === "max" ? "maximize" : "minimize"} E[v] subject to obedience.</p>
+
+                  {NP === 1 && (
+                    <div className="overflow-x-auto">
+                      <table className="border-collapse text-sm" style={S}>
+                        <thead>
+                          <tr>
+                            <th className="p-2 text-stone-400 text-xs">Action / State</th>
+                            {sL.map((l, j) => <th key={j} className="p-2 text-center text-xs font-semibold text-stone-600">{l}</th>)}
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {Array.from({ length: acts[0] }, (_, a) => (
+                            <tr key={a}>
+                              <td className="p-2 text-right text-xs font-semibold text-stone-600">{aL[0] && aL[0][a] ? aL[0][a] : `a${a + 1}`}</td>
+                              {Array.from({ length: K }, (_, th) => (
+                                <td key={th} className="p-1">
+                                  <input type="number" step="any" value={cObj[a * K + th] || 0}
+                                    onChange={e => updC(a * K + th, parseFloat(e.target.value) || 0)}
+                                    className="w-16 text-center text-sm bg-amber-50 rounded border border-amber-200 outline-none focus:border-amber-500 text-amber-800 px-1 py-1" style={M} />
+                                </td>
+                              ))}
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  )}
+
+                  {NP === 2 && Array.from({ length: K }, (_, th) => (
+                    <div key={th} className="mb-3">
+                      {K > 1 && <div className="text-xs font-medium text-stone-500 mb-1" style={S}>{sL[th]}</div>}
+                      <table className="border-collapse text-sm" style={S}>
+                        <thead>
+                          <tr>
+                            <th className="p-2 text-stone-400 text-xs">P1/P2</th>
+                            {Array.from({ length: acts[1] }, (_, j) => <th key={j} className="p-2 text-center text-xs font-semibold text-stone-600">{aL[1] && aL[1][j] ? aL[1][j] : `b${j + 1}`}</th>)}
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {Array.from({ length: acts[0] }, (_, a1) => (
+                            <tr key={a1}>
+                              <td className="p-2 text-right text-xs font-semibold text-stone-600">{aL[0] && aL[0][a1] ? aL[0][a1] : `a${a1 + 1}`}</td>
+                              {Array.from({ length: acts[1] }, (_, a2) => {
+                                const fi = (a1 * acts[1] + a2) * K + th;
+                                return (
+                                  <td key={a2} className="p-1">
+                                    <input type="number" step="any" value={cObj[fi] || 0} onChange={e => updC(fi, parseFloat(e.target.value) || 0)}
+                                      className="w-16 text-center text-sm bg-amber-50 rounded border border-amber-200 outline-none text-amber-800 px-1 py-1" style={M} />
+                                  </td>
+                                );
+                              })}
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  ))}
+
+                  {NP === 3 && Array.from({ length: K }, (_, th) => (
+                    <div key={th} className="mb-3">
+                      {K > 1 && <div className="text-xs font-medium text-stone-500 mb-1" style={S}>{sL[th]}</div>}
+                      {Array.from({ length: acts[2] }, (_, a3) => (
+                        <div key={a3} className="mb-2">
+                          <div className="text-xs text-stone-400 mb-1" style={S}>P3: {aL[2] && aL[2][a3] ? aL[2][a3] : `c${a3 + 1}`}</div>
+                          <table className="border-collapse text-sm" style={S}>
+                            <thead>
+                              <tr>
+                                <th className="p-1 text-stone-400 text-xs">P1/P2</th>
+                                {Array.from({ length: acts[1] }, (_, j) => <th key={j} className="p-1 text-center text-xs font-semibold text-stone-600">{aL[1] && aL[1][j] ? aL[1][j] : `b${j + 1}`}</th>)}
+                              </tr>
+                            </thead>
+                            <tbody>
+                              {Array.from({ length: acts[0] }, (_, a1) => (
+                                <tr key={a1}>
+                                  <td className="p-1 text-right text-xs font-semibold text-stone-600">{aL[0] && aL[0][a1] ? aL[0][a1] : `a${a1 + 1}`}</td>
+                                  {Array.from({ length: acts[1] }, (_, a2) => {
+                                    const fi = (a1 * acts[1] * acts[2] + a2 * acts[2] + a3) * K + th;
+                                    return (
+                                      <td key={a2} className="p-1">
+                                        <input type="number" step="any" value={cObj[fi] || 0} onChange={e => updC(fi, parseFloat(e.target.value) || 0)}
+                                          className="w-14 text-center text-xs bg-amber-50 rounded border border-amber-200 outline-none text-amber-800 px-1 py-1" style={M} />
+                                      </td>
+                                    );
+                                  })}
+                                </tr>
+                              ))}
+                            </tbody>
+                          </table>
+                        </div>
+                      ))}
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          </div>
+        )}
+
+        {/* ═══ RESULTS ═══ */}
+        {tab === "results" && (
+          <div className="space-y-6">
+            {!res && (
+              <div className="bg-white rounded-xl border border-stone-200 p-12 text-center shadow-sm">
+                <p className="text-stone-400 text-lg" style={S}>Set up a game and click <strong>Compute</strong>.</p>
+              </div>
+            )}
+
+            {res && res.status !== "optimal" && (
+              <div className="bg-red-50 border border-red-200 rounded-xl p-6">
+                <h3 className="text-red-800 font-semibold" style={S}>{res.status === "infeasible" ? "No feasible BCE" : "Unbounded"}</h3>
+                <p className="text-red-600 text-sm mt-1" style={S}>Check your inputs.</p>
+              </div>
+            )}
+
+            {res && res.status === "optimal" && (
+              <>
+                {/* Summary Cards */}
+                <div className={`grid grid-cols-1 gap-4 ${NP === 1 ? "md:grid-cols-2" : NP === 2 ? "md:grid-cols-3" : "md:grid-cols-4"}`}>
+                  <div className="bg-white rounded-xl border border-stone-200 p-5 shadow-sm">
+                    <div className="text-xs uppercase tracking-widest text-stone-400 mb-1" style={S}>{objSense === "max" ? "Maximum" : "Minimum"} {objLbl}</div>
+                    <div className="text-3xl font-bold text-stone-900" style={M}>{res.ov.toFixed(4)}</div>
+                  </div>
+                  {res.ep.map((ep, i) => (
+                    <div key={i} className="bg-white rounded-xl border p-5 shadow-sm" style={{ borderColor: BC[i], background: `linear-gradient(135deg,${BG[i]},#fff)` }}>
+                      <div className="text-xs uppercase tracking-widest mb-1" style={{ ...S, color: TC[i] }}>{NP === 1 ? "Agent" : `Player ${i + 1}`} Payoff</div>
+                      <div className="text-3xl font-bold" style={{ ...M, color: TB[i] }}>{ep.toFixed(4)}</div>
+                    </div>
+                  ))}
+                </div>
+
+                {/* Payoff plot (2P, or 1P with custom objective) */}
+                {NP === 2 && <PayoffPlot fr={fr} ni={ni} bceFr={bceFr} scFr={scFr} cp={res.ep} label={`${objSense} ${objLbl}`} nS={K} xLabel="E[u1]" yLabel="E[u2]" />}
+
+                {/* Surviving Actions (SC-CE only) */}
+                {survActs && (
+                  <div className="bg-white rounded-xl border border-stone-200 p-5 shadow-sm">
+                    <h3 className="text-sm font-semibold uppercase tracking-widest text-stone-400 mb-3" style={S}>Surviving Actions (Self-Contained)</h3>
+                    <p className="text-xs text-stone-500 mb-3" style={S}>Actions that survive iterated elimination. Only plans using these actions can support sequentially rational outcomes.</p>
+                    <div className="flex gap-6">
+                      {Array.from({ length: NP }, (_, i) => (
+                        <div key={i}>
+                          <div className="text-xs font-semibold mb-1" style={{ ...S, color: TC[i] || "#57534e" }}>Player {i + 1}</div>
+                          <div className="flex gap-1 flex-wrap">
+                            {Array.from({ length: acts[i] }, (_, a) => {
+                              const alive = survActs[i].includes(a);
+                              return (
+                                <span key={a} className={`px-2 py-1 rounded text-xs font-medium ${alive ? "bg-emerald-100 text-emerald-800 border border-emerald-300" : "bg-red-50 text-red-400 border border-red-200 line-through"}`}>
+                                  {aL[i] && aL[i][a] ? aL[i][a] : `${String.fromCharCode(97 + i)}${a + 1}`}
+                                </span>
+                              );
+                            })}
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+
+                {/* Active Plans (CE-DE / SC-CE) */}
+                {res.activePlans && res.activePlans.length > 0 && (concept === "cede" || concept === "scce") && (
+                  <div className="bg-white rounded-xl border border-stone-200 shadow-sm overflow-hidden">
+                    <button onClick={() => setShowPlans(!showPlans)} className="w-full px-5 py-4 text-left flex items-center justify-between hover:bg-stone-50" style={S}>
+                      <span className="text-sm font-semibold uppercase tracking-widest text-stone-400">Active Plans ({res.activePlans.length})</span>
+                      <span className="text-stone-400 text-lg">{showPlans ? "−" : "+"}</span>
+                    </button>
+                    {showPlans && (
+                      <div className="px-5 pb-5 border-t border-stone-100 pt-4 space-y-3">
+                        <p className="text-xs text-stone-500" style={S}>Plans with positive weight in the optimal solution. The obedient path is the recommended play; off-path branches are contingent responses (threats).</p>
+                        {res.activePlans.map((ap, idx) => {
+                          const pl = ap.plan;
+                          const is3P = pl.order && pl.order.length === 3;
+
+                          if (!is3P) {
+                            // 2P plan display
+                            const firstLabel = pl.first === 0 ? "P1" : "P2";
+                            const secondLabel = pl.first === 0 ? "P2" : "P1";
+                            const firstActs = pl.first === 0 ? acts[0] : acts[1];
+                            const firstAL = pl.first === 0 ? (aL[0] || []) : (aL[1] || []);
+                            const secondAL = pl.first === 0 ? (aL[1] || []) : (aL[0] || []);
+                            const recLabel = firstAL[pl.rec] || `${pl.rec}`;
+                            return (
+                              <div key={idx} className="p-3 rounded-lg bg-stone-50 border border-stone-200 text-xs" style={S}>
+                                <div className="flex items-center justify-between mb-2">
+                                  <span className="font-semibold text-stone-700">Plan {idx + 1}: {firstLabel} moves first</span>
+                                  <span className="text-stone-400 font-mono" style={M}>weight = {ap.weight.toFixed(4)}</span>
+                                </div>
+                                <div className="ml-2 space-y-1">
+                                  <div className="text-stone-600">{firstLabel} recommended: <span className="font-semibold">{recLabel}</span></div>
+                                  {Array.from({ length: firstActs }, (_, a) => {
+                                    const isObedient = a === pl.rec;
+                                    const respLabel = secondAL[pl.resp[a]] || `${pl.resp[a]}`;
+                                    return (
+                                      <div key={a} className={`ml-3 ${isObedient ? "text-emerald-700" : "text-stone-400"}`}>
+                                        If {firstLabel} plays {firstAL[a] || a} → {secondLabel} told: <span className="font-semibold">{respLabel}</span>
+                                        {isObedient ? " ← obedient" : ""}
+                                      </div>
+                                    );
+                                  })}
+                                </div>
+                              </div>
+                            );
+                          }
+
+                          // 3P plan display
+                          const [p0, p1, p2] = pl.order;
+                          const pName = (i) => `P${i + 1}`;
+                          const aName = (i, a) => (aL[i] && aL[i][a]) ? aL[i][a] : `${String.fromCharCode(97 + i)}${a + 1}`;
+                          return (
+                            <div key={idx} className="p-3 rounded-lg bg-stone-50 border border-stone-200 text-xs" style={S}>
+                              <div className="flex items-center justify-between mb-2">
+                                <span className="font-semibold text-stone-700">Plan {idx + 1}: {pName(p0)} → {pName(p1)} → {pName(p2)}</span>
+                                <span className="text-stone-400 font-mono" style={M}>weight = {ap.weight.toFixed(4)}</span>
+                              </div>
+                              <div className="ml-2 space-y-0.5">
+                                <div className="text-emerald-700">{pName(p0)} recommended: <span className="font-semibold">{aName(p0, pl.rec)}</span></div>
+                                <div className="text-emerald-700 ml-3">{pName(p1)} told: <span className="font-semibold">{aName(p1, pl.r1[pl.rec])}</span></div>
+                                <div className="text-emerald-700 ml-6">{pName(p2)} told: <span className="font-semibold">{aName(p2, pl.r2[pl.rec * pl.m1 + pl.r1[pl.rec]])}</span> ← obedient path</div>
+                              </div>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    )}
+                  </div>
+                )}
+                {NP === 1 && objType === "custom" && fr && (
+                  <PayoffPlot fr={fr} ni={ni} cp={[res.ep[0], res.ov]} label={`${objSense} ${objLbl}`} nS={K}
+                    xLabel="E[agent payoff]" yLabel="E[designer objective]" />
+                )}
+
+                {/* Distribution (collapsible) */}
+                <div className="bg-white rounded-xl border border-stone-200 shadow-sm overflow-hidden">
+                  <button onClick={() => setShowDist(!showDist)} className="w-full px-5 py-4 text-left flex items-center justify-between hover:bg-stone-50" style={S}>
+                    <span className="text-sm font-semibold uppercase tracking-widest text-stone-400">BCE Distribution</span>
+                    <span className="text-stone-400 text-lg">{showDist ? "−" : "+"}</span>
+                  </button>
+                  {showDist && (
+                    <div className="px-5 pb-5 border-t border-stone-100 pt-4">
+                      {NP === 1 && (
+                        <div className="overflow-x-auto">
+                          <table className="border-collapse w-full" style={S}>
+                            <thead>
+                              <tr>
+                                <th className="border border-stone-200 bg-stone-50 px-3 py-2 text-xs text-stone-500">Action / State</th>
+                                {sL.map((l, j) => <th key={j} className="border border-stone-200 bg-stone-50 px-3 py-2 text-xs font-semibold text-stone-600">{l}</th>)}
+                              </tr>
+                            </thead>
+                            <tbody>
+                              {Array.from({ length: acts[0] }, (_, a) => (
+                                <tr key={a}>
+                                  <td className="border border-stone-200 bg-stone-50 px-3 py-2 text-xs font-semibold text-stone-600">{aL[0] && aL[0][a] ? aL[0][a] : `a${a + 1}`}</td>
+                                  {Array.from({ length: K }, (_, th) => <HeatCell key={th} value={res.x[a * K + th]} mx={maxD} />)}
+                                </tr>
+                              ))}
+                            </tbody>
+                          </table>
+                        </div>
+                      )}
+                      {NP >= 2 && (
+                        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                          {Array.from({ length: K }, (_, th) => (
+                            <div key={th}>
+                              <div className="text-sm font-medium text-stone-600 mb-2" style={S}>{K === 1 ? "Joint Distribution" : sL[th]}</div>
+                              {NP === 2 && (
+                                <table className="border-collapse w-full" style={S}>
+                                  <thead>
+                                    <tr>
+                                      <th className="border border-stone-200 bg-stone-50 px-2 py-1.5 text-xs text-stone-500">P1/P2</th>
+                                      {Array.from({ length: acts[1] }, (_, j) => <th key={j} className="border border-stone-200 bg-stone-50 px-2 py-1.5 text-xs font-semibold text-stone-600">{aL[1] && aL[1][j] ? aL[1][j] : `b${j + 1}`}</th>)}
+                                    </tr>
+                                  </thead>
+                                  <tbody>
+                                    {Array.from({ length: acts[0] }, (_, a1) => (
+                                      <tr key={a1}>
+                                        <td className="border border-stone-200 bg-stone-50 px-2 py-1.5 text-xs font-semibold text-stone-600">{aL[0] && aL[0][a1] ? aL[0][a1] : `a${a1 + 1}`}</td>
+                                        {Array.from({ length: acts[1] }, (_, a2) => <HeatCell key={a2} value={res.x[(a1 * acts[1] + a2) * K + th]} mx={maxD} />)}
+                                      </tr>
+                                    ))}
+                                  </tbody>
+                                </table>
+                              )}
+                              {NP === 3 && Array.from({ length: acts[2] }, (_, a3) => (
+                                <div key={a3} className="mb-2">
+                                  <div className="text-xs text-stone-500 mb-1" style={S}>P3: {aL[2] && aL[2][a3] ? aL[2][a3] : `c${a3 + 1}`}</div>
+                                  <table className="border-collapse w-full" style={S}>
+                                    <thead>
+                                      <tr>
+                                        <th className="border border-stone-200 bg-stone-50 px-2 py-1 text-xs text-stone-500">P1/P2</th>
+                                        {Array.from({ length: acts[1] }, (_, j) => <th key={j} className="border border-stone-200 bg-stone-50 px-2 py-1 text-xs font-semibold text-stone-600">{aL[1] && aL[1][j] ? aL[1][j] : `b${j + 1}`}</th>)}
+                                      </tr>
+                                    </thead>
+                                    <tbody>
+                                      {Array.from({ length: acts[0] }, (_, a1) => (
+                                        <tr key={a1}>
+                                          <td className="border border-stone-200 bg-stone-50 px-2 py-1 text-xs font-semibold text-stone-600">{aL[0] && aL[0][a1] ? aL[0][a1] : `a${a1 + 1}`}</td>
+                                          {Array.from({ length: acts[1] }, (_, a2) => <HeatCell key={a2} value={res.x[(a1 * acts[1] * acts[2] + a2 * acts[2] + a3) * K + th]} mx={maxD} />)}
+                                        </tr>
+                                      ))}
+                                    </tbody>
+                                  </table>
+                                </div>
+                              ))}
+                            </div>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  )}
+                </div>
+
+                {/* LP details */}
+                <div className="bg-white rounded-xl border border-stone-200 shadow-sm overflow-hidden">
+                  <button onClick={() => setShowLP(!showLP)} className="w-full px-5 py-4 text-left flex items-center justify-between hover:bg-stone-50" style={S}>
+                    <span className="text-sm font-semibold uppercase tracking-widest text-stone-400">Mathematical Details</span>
+                    <span className="text-stone-400 text-lg">{showLP ? "−" : "+"}</span>
+                  </button>
+                  {showLP && (
+                    <div className="px-5 pb-5 border-t border-stone-100">
+                      <div className="mt-4 p-4 rounded-lg bg-stone-50 space-y-2" style={S}>
+                        {concept === "cede" && NP === 2 ? (<>
+                          <p className="text-stone-600 text-xs"><strong>Concept:</strong> Coordinated Equilibrium (Doval & Ely, 2020)</p>
+                          <p className="text-stone-600 text-xs"><strong>Plans:</strong> {acts[0] * Math.pow(acts[1], acts[0]) + acts[1] * Math.pow(acts[0], acts[1])} total ({acts[0] * Math.pow(acts[1], acts[0])} with P1 first, {acts[1] * Math.pow(acts[0], acts[1])} with P2 first)</p>
+                          <p className="text-stone-600 text-xs"><strong>Variables:</strong> {(acts[0] * Math.pow(acts[1], acts[0]) + acts[1] * Math.pow(acts[0], acts[1])) * K} (plans x states)</p>
+                          <p className="text-stone-600 text-xs"><strong>Obedience:</strong> {acts.map(m => m * (m - 1)).reduce((a, b) => a + b, 0)} constraints (same structure as BCE but deviation payoffs depend on plan responses)</p>
+                        </>) : (<>
+                          <p className="text-stone-600 text-xs"><strong>Concept:</strong> {NP === 1 ? "Bayesian Persuasion / BCE" : "Bayes Correlated Equilibrium (Bergemann & Morris, 2016)"}</p>
+                          <p className="text-stone-600 text-xs"><strong>Variables:</strong> {numProf} profiles x {K} states = {n}</p>
+                          <p className="text-stone-600 text-xs"><strong>Obedience:</strong> {acts.map(m => m * (m - 1)).reduce((a, b) => a + b, 0)} inequality constraints</p>
+                        </>)}
+                        <p className="text-stone-600 text-xs"><strong>Prior consistency:</strong> {K} equality constraints</p>
+                        <p className="text-stone-600 text-xs"><strong>Solved via:</strong> Big-M simplex in the browser</p>
+                      </div>
+                    </div>
+                  )}
+                </div>
+              </>
+            )}
+          </div>
+        )}
+
+        <footer className="mt-12 pt-6 border-t border-stone-200 text-center">
+          <p className="text-xs text-stone-400" style={S}>
+            Bergemann & Morris (2016). Kamenica & Gentzkow (2011). Bergemann, Brooks & Morris (2015). Doval & Ely (2020). All computation client-side.
+          </p>
+        </footer>
+      </div>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(React.createElement(App));
+  </script>
+</body>
+</html>
