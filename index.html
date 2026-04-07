@@ -830,7 +830,7 @@ function App() {
   const handleShare = () => {
     if (shareUrl) { setShareUrl(null); return; }
     const h = encH({ np: NP, a: acts, k: K, p: prior, py: payoffs, co: objType === "custom" ? cObj : null, al: aL, sl: sL, ot: objType, os: objSense });
-    if (h) { setShareUrl("https://YOUR-SITE.github.io/info-design-toolkit/index.html#" + h); setTimeout(() => { if (shareRef.current) shareRef.current.select(); }, 50); }
+    if (h) { setShareUrl("https://laura-doval.github.io/info-design-toolkit/index.html#" + h); setTimeout(() => { if (shareRef.current) shareRef.current.select(); }, 50); }
   };
 
   const objLbl = objType === "welfare" ? "welfare" : objType === "custom" ? "custom" : `P${objType.replace("player", "")}`;
